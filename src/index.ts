@@ -114,7 +114,9 @@ const server = Bun.serve({
       if (!room.host && room.viewers.size === 0) rooms.delete(ws.data.room);
     },
   },
-  development: process.env.NODE_ENV !== "production" && { hmr: true, console: true },
+  // Production unless explicitly asked for dev mode. Hot reload refreshes open
+  // pages when files change, which ends any live share, so keep it out of prod.
+  development: process.env.NODE_ENV === "development" && { hmr: true, console: true },
 });
 
-console.log(`Screenshare running at ${server.url}`);
+console.log(`Screenshare running at ${server.url} (${server.development ? "development" : "production"})`);

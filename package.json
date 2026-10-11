@@ -10,7 +10,7 @@
     "typescript": "^7"
   },
   "scripts": {
-    "dev": "bun --hot src/index.ts",
-    "start": "NODE_ENV=production bun src/index.ts"
+    "dev": "NODE_ENV=development bun --hot src/index.ts",
+    "start": "bun src/index.ts"
   }
 }
