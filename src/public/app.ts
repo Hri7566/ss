@@ -1,4 +1,11 @@
-type Signal = { sdp?: RTCSessionDescriptionInit; candidate?: RTCIceCandidateInit };
+// `fresh` marks an offer from a brand-new peer connection (vs. an ICE restart
+// on the existing one); `bye` means the other side is leaving on purpose.
+type Signal = {
+  sdp?: RTCSessionDescriptionInit;
+  candidate?: RTCIceCandidateInit;
+  fresh?: boolean;
+  bye?: boolean;
+};
 type ServerMsg =
   | { type: "viewer-joined"; id: string }
   | { type: "viewer-left"; id: string }
@@ -7,9 +14,11 @@ type ServerMsg =
   | { type: "host-left" }
   | { type: "error"; message: string };
 
-const RTC_CONFIG: RTCConfiguration = {
-  iceServers: [{ urls: "stun:stun.l.google.com:19302" }],
-};
+// STUN plus any TURN relays configured on the server (see README).
+const RTC_CONFIG: RTCConfiguration = await fetch("/api/ice")
+  .then(r => r.json() as Promise<RTCIceServer[]>)
+  .then(iceServers => ({ iceServers }))
+  .catch(() => ({ iceServers: [{ urls: "stun:stun.l.google.com:19302" }] }));
 
 const $ = <T extends HTMLElement>(id: string) => document.getElementById(id) as T;
 
@@ -30,19 +39,52 @@ function setStatus(text: string) {
   statusEl.textContent = text;
 }
 
-function connect(room: string, role: "host" | "viewer"): WebSocket {
-  const proto = location.protocol === "https:" ? "wss:" : "ws:";
-  return new WebSocket(`${proto}//${location.host}/ws?room=${room}&role=${role}`);
-}
+type Signaling = { send(msg: object): void; close(): void };
 
-// Handle messages strictly in order. With a plain async onmessage, an ICE
-// candidate can be processed while setRemoteDescription is still pending,
-// which throws and drops the candidate, so the peer may never connect.
-function onMessages(ws: WebSocket, handle: (msg: ServerMsg) => Promise<void>) {
+// A signaling socket that reconnects on its own. The id is kept across
+// reconnects so the server and the other side see the same peer come back.
+// Video flows peer-to-peer, so it keeps playing while this is down.
+function signaling(
+  room: string,
+  role: "host" | "viewer",
+  handle: (msg: ServerMsg) => Promise<void>,
+  onState: (connected: boolean) => void = () => {},
+): Signaling {
+  const id = crypto.randomUUID();
+  const proto = location.protocol === "https:" ? "wss:" : "ws:";
+  let ws: WebSocket;
+  let closed = false;
+  let delay = 1000;
+  // Handle messages strictly in order. With a plain async onmessage, an ICE
+  // candidate can be processed while setRemoteDescription is still pending,
+  // which throws and drops the candidate, so the peer may never connect.
   let queue = Promise.resolve();
-  ws.onmessage = ev => {
-    const msg = JSON.parse(ev.data) as ServerMsg;
-    queue = queue.then(() => handle(msg)).catch(err => console.error("signaling error:", err));
+
+  const open = () => {
+    ws = new WebSocket(`${proto}//${location.host}/ws?room=${room}&role=${role}&id=${id}`);
+    ws.onopen = () => {
+      delay = 1000;
+      onState(true);
+    };
+    ws.onmessage = ev => {
+      const msg = JSON.parse(ev.data) as ServerMsg;
+      queue = queue.then(() => handle(msg)).catch(err => console.error("signaling error:", err));
+    };
+    ws.onclose = () => {
+      if (closed) return;
+      onState(false);
+      setTimeout(open, delay);
+      delay = Math.min(delay * 2, 10_000);
+    };
+  };
+  open();
+
+  return {
+    send: msg => ws.readyState === WebSocket.OPEN && ws.send(JSON.stringify(msg)),
+    close: () => {
+      closed = true;
+      ws.close();
+    },
   };
 }
 
@@ -112,9 +154,10 @@ async function startHost(withAudio: boolean) {
   setStatus("You're sharing. Send the link above to anyone who should watch.");
 
   const peers = new Map<string, RTCPeerConnection>();
-  const ws = connect(room, "host");
-  const sendSignal = (to: string, data: Signal) =>
-    ws.send(JSON.stringify({ type: "signal", to, data }));
+  // Viewers whose signaling socket is currently connected.
+  const present = new Set<string>();
+
+  const sendSignal = (to: string, data: Signal) => sig.send({ type: "signal", to, data });
   const updateCount = () =>
     (viewerCount.textContent = `${peers.size} viewer${peers.size === 1 ? "" : "s"}`);
 
@@ -124,28 +167,70 @@ async function startHost(withAudio: boolean) {
     updateCount();
   };
 
-  onMessages(ws, async msg => {
+  // Try to repair a broken connection in place, e.g. after a viewer's network
+  // changes. Needs the viewer's signaling socket to be up.
+  const restartIce = async (id: string, pc: RTCPeerConnection) => {
+    if (!present.has(id)) return;
+    // An earlier offer may have been lost while signaling was down; start over.
+    if (pc.signalingState !== "stable") return createPeer(id);
+    await pc.setLocalDescription(await pc.createOffer({ iceRestart: true }));
+    sendSignal(id, { sdp: pc.localDescription!.toJSON() });
+  };
+
+  const createPeer = async (id: string) => {
+    closePeer(id);
+    const pc = new RTCPeerConnection(RTC_CONFIG);
+    peers.set(id, pc);
+    updateCount();
+    for (const track of stream.getTracks()) pc.addTrack(track, stream);
+    pc.onicecandidate = e => e.candidate && sendSignal(id, { candidate: e.candidate.toJSON() });
+    pc.onconnectionstatechange = () => {
+      if (peers.get(id) !== pc) return;
+      switch (pc.connectionState) {
+        case "failed":
+          if (present.has(id)) restartIce(id, pc).catch(console.error);
+          else closePeer(id);
+          break;
+        case "disconnected":
+          // Often recovers on its own; restart if it hasn't after a few seconds.
+          setTimeout(() => {
+            if (pc.connectionState === "disconnected") restartIce(id, pc).catch(console.error);
+          }, 5000);
+          break;
+      }
+    };
+    await pc.setLocalDescription(await pc.createOffer());
+    await Promise.all(pc.getSenders().map(tuneSender));
+    sendSignal(id, { sdp: pc.localDescription!.toJSON(), fresh: true });
+  };
+
+  const sig = signaling(room, "host", async msg => {
     switch (msg.type) {
       case "viewer-joined": {
-        const pc = new RTCPeerConnection(RTC_CONFIG);
-        peers.set(msg.id, pc);
-        updateCount();
-        for (const track of stream.getTracks()) pc.addTrack(track, stream);
-        pc.onicecandidate = e => e.candidate && sendSignal(msg.id, { candidate: e.candidate.toJSON() });
-        pc.onconnectionstatechange = () => {
-          if (pc.connectionState === "failed") closePeer(msg.id);
-        };
-        await pc.setLocalDescription(await pc.createOffer());
-        await Promise.all(pc.getSenders().map(tuneSender));
-        sendSignal(msg.id, { sdp: pc.localDescription!.toJSON() });
+        // Also sent for every viewer when the host's own socket reconnects.
+        present.add(msg.id);
+        const pc = peers.get(msg.id);
+        const state = pc?.connectionState;
+        if (state === "connected") break;
+        if (pc && (state === "disconnected" || state === "failed")) await restartIce(msg.id, pc);
+        else await createPeer(msg.id);
         break;
       }
-      case "viewer-left":
-        closePeer(msg.id);
+      case "viewer-left": {
+        // A dropped socket doesn't mean the video is gone; only drop the peer
+        // if it isn't connected. Otherwise wait for the viewer to come back.
+        present.delete(msg.id);
+        if (peers.get(msg.id)?.connectionState !== "connected") closePeer(msg.id);
         break;
+      }
       case "signal": {
         const pc = msg.from && peers.get(msg.from);
-        if (!pc) return;
+        if (!pc || !msg.from) return;
+        if (msg.data.bye) {
+          present.delete(msg.from);
+          closePeer(msg.from);
+          return;
+        }
         if (msg.data.sdp) await pc.setRemoteDescription(msg.data.sdp);
         if (msg.data.candidate) await pc.addIceCandidate(msg.data.candidate);
         break;
@@ -156,15 +241,21 @@ async function startHost(withAudio: boolean) {
     }
   });
 
+  const sayBye = () => {
+    for (const id of peers.keys()) sendSignal(id, { bye: true });
+  };
+
   const stop = () => {
+    sayBye();
     for (const t of stream.getTracks()) t.stop();
     for (const id of [...peers.keys()]) closePeer(id);
-    ws.close();
+    sig.close();
     hostBar.hidden = true;
     video.srcObject = null;
     setStatus("Sharing stopped.");
   };
 
+  addEventListener("pagehide", sayBye);
   stopBtn.onclick = stop;
   // Fires when the user hits the browser's own "Stop sharing" button.
   stream.getVideoTracks()[0]?.addEventListener("ended", stop);
@@ -184,49 +275,76 @@ function startViewer(room: string) {
   video.onclick = () => (video.muted = !video.muted);
   setStatus("Connecting…");
 
-  const ws = connect(room, "viewer");
   let pc: RTCPeerConnection | undefined;
-  const sendSignal = (data: Signal) => ws.send(JSON.stringify({ type: "signal", data }));
+  let stopped = false;
+  const live = () => pc?.connectionState === "connected";
+  const sendSignal = (data: Signal) => sig.send({ type: "signal", data });
 
-  onMessages(ws, async msg => {
-    switch (msg.type) {
-      case "waiting":
-        setStatus("Waiting for the host to start sharing…");
-        break;
-      case "host-left":
-        pc?.close();
-        pc = undefined;
-        video.srcObject = null;
-        setStatus("The host stopped sharing.");
-        break;
-      case "signal": {
-        if (msg.data.sdp?.type === "offer") {
-          pc?.close();
-          pc = new RTCPeerConnection(RTC_CONFIG);
-          pc.onicecandidate = e => e.candidate && sendSignal({ candidate: e.candidate.toJSON() });
-          pc.onconnectionstatechange = () => {
-            if (pc?.connectionState === "failed") {
-              setStatus("Couldn't connect to the host. A firewall or strict network may be blocking peer-to-peer video.");
-            }
-          };
-          pc.ontrack = e => {
-            video.srcObject = e.streams[0] ?? new MediaStream([e.track]);
-            setStatus("Live. Click the video to toggle sound.");
-          };
-          await pc.setRemoteDescription(msg.data.sdp);
-          await pc.setLocalDescription(await pc.createAnswer());
-          sendSignal({ sdp: pc.localDescription!.toJSON() });
-        } else if (msg.data.candidate && pc) {
-          await pc.addIceCandidate(msg.data.candidate);
-        }
-        break;
+  const createPeer = () => {
+    pc?.close();
+    const peer = new RTCPeerConnection(RTC_CONFIG);
+    pc = peer;
+    peer.onicecandidate = e => e.candidate && sendSignal({ candidate: e.candidate.toJSON() });
+    peer.ontrack = e => (video.srcObject = e.streams[0] ?? new MediaStream([e.track]));
+    peer.onconnectionstatechange = () => {
+      if (pc !== peer) return;
+      switch (peer.connectionState) {
+        case "connected":
+          setStatus("Live. Click the video to toggle sound.");
+          break;
+        case "disconnected":
+          setStatus("Connection interrupted, reconnecting…");
+          break;
+        case "failed":
+          setStatus(
+            "Lost the connection to the host, trying again… If this keeps happening, your network may be blocking peer-to-peer video.",
+          );
+          break;
       }
-    }
-  });
-
-  ws.onclose = () => {
-    if (!video.srcObject) setStatus("Disconnected from server.");
+    };
+    return peer;
   };
+
+  const sig = signaling(
+    room,
+    "viewer",
+    async msg => {
+      switch (msg.type) {
+        case "waiting":
+          if (!live()) setStatus("Waiting for the host to start sharing…");
+          break;
+        case "host-left":
+          // The host's socket may just be reconnecting; the video can carry on.
+          if (!live() && !stopped) setStatus("Waiting for the host to reconnect…");
+          break;
+        case "signal": {
+          const { data } = msg;
+          if (data.bye) {
+            stopped = true;
+            pc?.close();
+            pc = undefined;
+            video.srcObject = null;
+            setStatus("The host stopped sharing.");
+          } else if (data.sdp?.type === "offer") {
+            stopped = false;
+            // A fresh offer needs a new connection; an ICE restart reuses ours.
+            const peer = data.fresh || !pc || pc.signalingState === "closed" ? createPeer() : pc;
+            await peer.setRemoteDescription(data.sdp);
+            await peer.setLocalDescription(await peer.createAnswer());
+            sendSignal({ sdp: peer.localDescription!.toJSON() });
+          } else if (data.candidate && pc) {
+            await pc.addIceCandidate(data.candidate);
+          }
+          break;
+        }
+      }
+    },
+    connected => {
+      if (!connected && !live() && !stopped) setStatus("Reconnecting to server…");
+    },
+  );
+
+  addEventListener("pagehide", () => sendSignal({ bye: true }));
 }
 
 // ---------- Routing ----------
