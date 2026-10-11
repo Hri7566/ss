@@ -1,0 +1,32 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Screenshare</title>
+    <link rel="stylesheet" href="./style.css" />
+  </head>
+  <body>
+    <main>
+      <section id="start" hidden>
+        <h1>Screenshare</h1>
+        <p>Pick a screen, window, or tab to share. You'll get a link anyone can open to watch.</p>
+        <button id="share-btn">Start sharing</button>
+        <button id="share-no-audio-btn" hidden>Share without audio</button>
+        <p id="start-error" class="error"></p>
+      </section>
+
+      <section id="room" hidden>
+        <div id="host-bar" class="bar" hidden>
+          <input id="link" readonly />
+          <button id="copy-btn">Copy link</button>
+          <span id="viewer-count">0 viewers</span>
+          <button id="stop-btn" class="danger">Stop</button>
+        </div>
+        <p id="status"></p>
+        <video id="video" autoplay playsinline muted></video>
+      </section>
+    </main>
+    <script type="module" src="./app.ts"></script>
+  </body>
+</html>
