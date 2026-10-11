@@ -26,6 +26,8 @@ const ROOM_ID = /^[a-z0-9]{4,32}$/;
 
 const server = Bun.serve({
   port: Number(process.env.PORT ?? 3000),
+  // Set HOST=127.0.0.1 when running behind a reverse proxy like nginx.
+  hostname: process.env.HOST ?? "0.0.0.0",
   routes: {
     "/": index,
     "/s/:id": index,
@@ -44,6 +46,10 @@ const server = Bun.serve({
   },
   websocket: {
     data: {} as WsData,
+    // Signaling sockets go quiet once peers connect. A short idle timeout makes
+    // Bun ping them often, so proxies (nginx defaults to 60s) don't drop them.
+    idleTimeout: 30,
+    sendPings: true,
     open(ws) {
       const room = getRoom(ws.data.room);
       if (ws.data.role === "host") {
